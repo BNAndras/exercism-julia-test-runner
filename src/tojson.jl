@@ -10,6 +10,20 @@ const MAX_REPORTED_FAILURES_PER_TESTSET = 5
 const MAX_REPORTED_PASSING_TEST_CODE_PER_COLLAPSE = 5
 
 """
+    error_message(result::Test.Error)
+
+Return only the diagnostic information preceding the first stack trace.
+Stack traces are omitted because they contain Julia version paths or
+standard library line numbers that can change between Julia releases.
+
+Returns the error message if there's no stack trace instead.
+"""
+function error_message(result::Test.Error)
+    message = first(split(result.backtrace, "\nStacktrace:"; limit=2))
+    isempty(message) ? result.value : message
+end
+
+"""
     tojson(output::String, ts::ReportingTestSet)
 
 Takes user output and a ReportingTestSet and converts it to a JSON string as
@@ -59,11 +73,11 @@ function tojson(output::String, ts::ReportingTestSet)
     if length(ts.results) == 1 && ts.results[1] isa Test.Error
         # There has been a syntax error or similar and no tests have run.
         # Otherwise ts.results[1] will be a ReportingTestSet.
-        return JSON.json(Dict(
-            "version" => 3,
-            "status" => "error",
-            "message" => ts.results[1].backtrace,
-            "tests" => [],
+        return JSON.json((
+            status = "error",
+            message = error_message(ts.results[1]),
+            version = 3,
+            tests = [],
         ), 4)
     end
 
@@ -118,7 +132,7 @@ function tojson(output::String, ts::ReportingTestSet)
             message = string(result)
         elseif result isa Test.Error
             status = "error"
-            message = result.backtrace
+            message = error_message(result)
         elseif result isa Test.Broken
             if result.test_type === :skipped
                 return nothing
@@ -131,29 +145,30 @@ function tojson(output::String, ts::ReportingTestSet)
 
         any_failed = any_failed || status in ("fail", "error")
 
-        return push!(tests, Dict(filter( ((k, v),) -> !isnothing(v), (
-            "name" => name,
-            "status" => status,
-            "message" => message,
-            "test_code" => test_code(result),
-            "output" => output,
-            "task_id" => task_id
-        ))))
+        fields = Pair{Symbol, Any}[
+            :name => name,
+            :test_code => test_code(result),
+            :status => status,
+            :message => message,
+            :output => output,
+            :task_id => task_id,
+        ]
+        return push!(tests, (; filter(field -> !isnothing(field.second), fields)...))
     end
 
     """
-        walk!(tests, prefix, testset)
+        walk!(tests, prefix, testset, inherited_task_id=nothing)
 
     Walk the tree of testsets, pushing Dicts to `tests` describing each test
     result. Returns nothing.
     """
-    function walk!(tests, prefix, testset)
+    function walk!(tests, prefix, testset, inherited_task_id=nothing)
         name = testset.verbose ? "" : isempty(prefix) ? testset.description : "$prefix » $(testset.description)"
 
         num_results = count(x -> x isa Test.Result, testset.results)
 
         task_id, name = startswith(name, r"\d+\. +") ? match(r"^(\d+)\. +(.*)", name).captures : [nothing, strip(name)]
-        task_id = isnothing(task_id) ? nothing : parse(Int, task_id)
+        task_id = isnothing(task_id) ? inherited_task_id : parse(Int, task_id)
         
         function test_name(result, idx)
             if name == "" # Tests that aren't in a testset
@@ -179,13 +194,13 @@ function tojson(output::String, ts::ReportingTestSet)
                 code = join(map(test_code, passing_tests), '\n')
             end
 
-            push!(tests, Dict(filter(kv -> !isnothing(kv.second), (
-                "name" => collapsed_name,
-                "status" => "pass",
-                "test_code" => code,
-                "task_id" => task_id
-                )))
-            )
+            fields = Pair{Symbol, Any}[
+                :name => collapsed_name,
+                :test_code => code,
+                :status => "pass",
+                :task_id => task_id,
+            ]
+            push!(tests, (; filter(field -> !isnothing(field.second), fields)...))
 
         end
 
@@ -195,7 +210,7 @@ function tojson(output::String, ts::ReportingTestSet)
         num_reported_failures = 0
         for (n, result) in enumerate(testset.results)
             if result isa Test.AbstractTestSet
-                walk!(tests, name, result)
+                walk!(tests, name, result, task_id)
             elseif result isa Test.Pass
                 collapse_passing_tests || push_result!(tests, result, test_name(result, n), task_id)
             else
@@ -206,13 +221,13 @@ function tojson(output::String, ts::ReportingTestSet)
         return nothing
     end
 
-    tests = Dict{String, Union{String, SubString, Int, Nothing}}[]
+    tests = NamedTuple[]
 
     walk!(tests, "", ts)
 
-    JSON.json(Dict(
-        "version" => 3,
-        "status" => any_failed ? "fail" : "pass",
-        "tests" => tests,
+    JSON.json((
+        status = any_failed ? "fail" : "pass",
+        version = 3,
+        tests = tests,
     ), 4)
 end
